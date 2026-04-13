@@ -5,7 +5,7 @@ import os
 class OldBooksDataclass(Dataset):
     """Dataclass for old-books-dataset"""
 
-    def __init__(self, root_dir, images_folder='300dpi/tiff', ground_truths_folder='groundtruth', 
+    def __init__(self, root_dir, images_folder='300dpi', ground_truths_folder='groundtruth', 
                  augmentation=None, preprocessing=None):
         """
         Args:
