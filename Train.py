@@ -1,3 +1,4 @@
+import matplotlib.pyplot as plt
 import torch
 import tqdm
 import os
@@ -23,7 +24,8 @@ def train_epoch(model, train_loader, criterion, optimizer, metrics):
     model.train()
 
     running_loss = 0.0
-    running_metrics = 0.0
+    running_metrics = {}
+    n_batches = 0
 
     pbar = tqdm(train_loader, desc="Training")
         
@@ -38,13 +40,22 @@ def train_epoch(model, train_loader, criterion, optimizer, metrics):
         loss.backward()
         optimizer.step()
 
-        train_metrics = metrics(outputs, texts)
+        batch_metrics = metrics(outputs, texts)
+        for k, v in batch_metrics.items():
+            running_metrics[k] = running_metrics.get(k, 0.0) + v
+        
+        # train_metrics = metrics(outputs, texts)
         running_loss += loss.item()
+        n_batches += 1
     
-    avg_loss = running_loss / len(train_loader)
-    avg_metrics = {k: v / len(train_loader) for k, v in train_metrics.items()}
+    if n_batches == 0:
+        return 0.0, {}
+    
+    avg_loss = running_loss / n_batches
+    avg_metrics = {k: v / n_batches for k, v in running_metrics.items()}
 
     return avg_loss, avg_metrics
+
 
 # Validate function on one epoch
 def validate_epoch(model, val_loader, criterion, metrics):
@@ -64,30 +75,43 @@ def validate_epoch(model, val_loader, criterion, metrics):
     model.eval()
 
     running_loss = 0.0
+    running_metrics = {}
+    n_batches = 0
 
     pbar = tqdm(val_loader, desc="Validation")
 
     with torch.no_grad():
         for images, texts in pbar:
             images = images.to(device)
-            masks = masks.to(device)
+            texts = texts.to(device)
 
             outputs = model(images)
 
-            loss = criterion(outputs, masks)
+            loss = criterion(outputs, texts)
+            
+            batch_metrics = metrics(outputs, texts)
+            for k, v in batch_metrics.items():
+                running_metrics[k] = running_metrics.get(k, 0.0) + v
 
-            val_metrics = metrics(outputs, texts)
+            # val_metrics = metrics(outputs, texts)
             running_loss += loss.item()
+            
+            n_batches += 1
 
-    avg_loss = running_loss / len(val_loader)
-    avg_metrics = {k: v / len(val_loader) for k, v in val_metrics.items()}
+    if n_batches == 0:
+        return 0.0, {}
+
+    avg_loss = running_loss / n_batches
+    avg_metrics = {k: v / n_batches for k, v in running_metrics.items()}
 
     return avg_loss, avg_metrics
+
 
 # Counting parameters of model function
 def count_parameters(model):
     parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return parameters
+
 
 # Train function
 def train_model(model, num_epochs,
@@ -183,4 +207,28 @@ def train_model(model, num_epochs,
         'Number of parameters': number_of_parameters
     }
     final_results.update({k: v[-1] for k, v in history.items()})
-    json.dump(final_results, 'final_metrics', indent=2)
+
+    # сохранение метрик
+    with open('final_metrics.json','w') as f:
+        json.dump(final_results, f, indent=2)
+
+
+def plot_metrics(history):
+
+    plt.figure(figsize=(12, 6))
+
+    plt.subplot(1, 2, 1)
+    plt.plot(history['train_loss'], label='Train Loss')
+    plt.plot(history['val_loss'], label='Val Loss')
+    plt.legend()
+    plt.title('Losses')
+
+    plt.subplot(1, 2, 2)
+    for metric in history.keys():
+        if metric.startswith('train_') and 'loss' not in metric:
+            plt.plot(history[metric], label=metric)
+    plt.legend()
+    plt.title('Metrics')
+
+    plt.show()
+
