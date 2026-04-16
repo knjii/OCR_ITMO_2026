@@ -1,234 +1,528 @@
+import json
+import math
+import os
+from contextlib import nullcontext
+from pathlib import Path
+from typing import Sequence
+
 import matplotlib.pyplot as plt
 import torch
-import tqdm
-import os
-import json
+from tqdm.auto import tqdm
 
-# Train function on one epoch
-def train_epoch(model, train_loader, criterion, optimizer, metrics):
-    
-    """
-    Input:
-        model (nn.Module class) - using model
-        train_loader (torch.Dataloader) - DataLoader for train dataset
-        criterion (function) - using criterion in training
-        optimizer (function) - using optimier in training
-        metrics (function) - calculated metrics for researching
-    Output:
-        avg_loss (float) - average loss
-        avg_metrics (dict) - average metrics
 
-    """
-    device='cuda' if torch.cuda.is_available() else 'cpu'
+DEFAULT_OCR_ALPHABET = (
+    "abcdefghijklmnopqrstuvwxyz"
+    "0123456789"
+    " .,;:!?\"'()-[]/&"
+)
+
+
+try:
+    import Levenshtein
+except ImportError:  # pragma: no cover - optional speedup
+    Levenshtein = None
+
+
+def count_parameters(model: torch.nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def create_grad_scaler(enabled: bool = True):
+    enabled = enabled and torch.cuda.is_available()
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def _autocast(device: torch.device, enabled: bool):
+    if enabled and device.type == "cuda":
+        if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+            return torch.amp.autocast(device_type="cuda")
+        return torch.cuda.amp.autocast()
+    return nullcontext()
+
+
+def _as_batch_first(log_probs: torch.Tensor, batch_size: int) -> torch.Tensor:
+    if log_probs.ndim != 3:
+        raise ValueError(f"Expected 3D CTC log_probs, got shape {tuple(log_probs.shape)}")
+    if log_probs.shape[0] == batch_size:
+        return log_probs
+    if log_probs.shape[1] == batch_size:
+        return log_probs.transpose(0, 1).contiguous()
+    raise ValueError(
+        f"Cannot infer batch dimension for shape {tuple(log_probs.shape)} and batch={batch_size}"
+    )
+
+
+def _as_time_first(log_probs: torch.Tensor, batch_size: int) -> torch.Tensor:
+    if log_probs.ndim != 3:
+        raise ValueError(f"Expected 3D CTC log_probs, got shape {tuple(log_probs.shape)}")
+    if log_probs.shape[1] == batch_size:
+        return log_probs
+    if log_probs.shape[0] == batch_size:
+        return log_probs.transpose(0, 1).contiguous()
+    raise ValueError(
+        f"Cannot infer batch dimension for shape {tuple(log_probs.shape)} and batch={batch_size}"
+    )
+
+
+def ctc_greedy_decode(
+    log_probs: torch.Tensor,
+    input_lengths: torch.Tensor | Sequence[int] | None = None,
+    alphabet: str = DEFAULT_OCR_ALPHABET,
+    blank_index: int = 0,
+) -> list[str]:
+    """Greedy CTC decoder: argmax, remove duplicates, remove blank."""
+
+    if input_lengths is None:
+        batch_size = log_probs.shape[0]
+        lengths = None
+    else:
+        lengths = [int(x) for x in torch.as_tensor(input_lengths).cpu().tolist()]
+        batch_size = len(lengths)
+
+    batch_first = _as_batch_first(log_probs.detach(), batch_size)
+    predictions = batch_first.argmax(dim=-1).cpu()
+
+    if lengths is None:
+        lengths = [predictions.shape[1]] * predictions.shape[0]
+
+    decoded: list[str] = []
+    for indices, length in zip(predictions, lengths):
+        chars: list[str] = []
+        prev_idx: int | None = None
+        for idx in indices[:length].tolist():
+            idx = int(idx)
+            if idx == blank_index:
+                prev_idx = idx
+                continue
+            if idx == prev_idx:
+                continue
+            if 1 <= idx <= len(alphabet):
+                chars.append(alphabet[idx - 1])
+            prev_idx = idx
+        decoded.append("".join(chars))
+    return decoded
+
+
+def _edit_distance(a: Sequence, b: Sequence) -> int:
+    if isinstance(a, str) and isinstance(b, str) and Levenshtein is not None:
+        return int(Levenshtein.distance(a, b))
+
+    if len(a) < len(b):
+        a, b = b, a
+
+    previous = list(range(len(b) + 1))
+    for i, item_a in enumerate(a, start=1):
+        current = [i]
+        for j, item_b in enumerate(b, start=1):
+            insert = current[j - 1] + 1
+            delete = previous[j] + 1
+            replace = previous[j - 1] + (item_a != item_b)
+            current.append(min(insert, delete, replace))
+        previous = current
+    return previous[-1]
+
+
+class OCRMetricTracker:
+    """Accumulates OCR metrics without batch-size bias."""
+
+    def __init__(self) -> None:
+        self.char_distance = 0
+        self.char_total = 0
+        self.word_distance = 0
+        self.word_total = 0
+        self.exact_matches = 0
+        self.total = 0
+
+    def update(self, predictions: Sequence[str], targets: Sequence[str]) -> None:
+        for pred, target in zip(predictions, targets):
+            self.char_distance += _edit_distance(pred, target)
+            self.char_total += max(1, len(target))
+
+            pred_words = pred.split()
+            target_words = target.split()
+            self.word_distance += _edit_distance(pred_words, target_words)
+            self.word_total += max(1, len(target_words))
+
+            self.exact_matches += int(pred == target)
+            self.total += 1
+
+    def compute(self) -> dict[str, float]:
+        if self.total == 0:
+            return {"cer": 0.0, "wer": 0.0, "accuracy": 0.0}
+        return {
+            "cer": self.char_distance / self.char_total,
+            "wer": self.word_distance / self.word_total,
+            "accuracy": self.exact_matches / self.total,
+        }
+
+
+def calculate_ocr_metrics(
+    log_probs: torch.Tensor,
+    texts: Sequence[str],
+    input_lengths: torch.Tensor | Sequence[int] | None,
+    alphabet: str = DEFAULT_OCR_ALPHABET,
+    blank_index: int = 0,
+) -> dict[str, float]:
+    predictions = ctc_greedy_decode(
+        log_probs=log_probs,
+        input_lengths=input_lengths,
+        alphabet=alphabet,
+        blank_index=blank_index,
+    )
+    tracker = OCRMetricTracker()
+    tracker.update(predictions, texts)
+    return tracker.compute()
+
+
+def _move_batch_to_device(batch: dict, device: torch.device) -> dict:
+    return {
+        key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value
+        for key, value in batch.items()
+    }
+
+
+def _ctc_loss_from_batch(
+    model: torch.nn.Module,
+    batch: dict,
+    criterion: torch.nn.Module,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    images = batch["images"]
+    batch_size = images.shape[0]
+    log_probs = model(images)
+    time_first = _as_time_first(log_probs, batch_size=batch_size)
+
+    input_lengths = batch["input_lengths"].to("cpu")
+    target_lengths = batch["target_lengths"].to("cpu")
+
+    loss = criterion(
+        time_first,
+        batch["targets"],
+        input_lengths,
+        target_lengths,
+    )
+    return loss, log_probs
+
+
+def train_epoch(
+    model: torch.nn.Module,
+    train_loader,
+    criterion: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    *,
+    scaler=None,
+    device: torch.device | str | None = None,
+    alphabet: str = DEFAULT_OCR_ALPHABET,
+    blank_index: int = 0,
+    accumulation_steps: int = 1,
+    max_grad_norm: float | None = 1.0,
+    use_amp: bool = True,
+    compute_metrics: bool = True,
+) -> tuple[float, dict[str, float]]:
+    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    scaler = scaler or create_grad_scaler(enabled=use_amp)
+    accumulation_steps = max(1, int(accumulation_steps))
 
     model.train()
+    optimizer.zero_grad(set_to_none=True)
 
     running_loss = 0.0
-    running_metrics = {}
-    n_batches = 0
+    sample_count = 0
+    tracker = OCRMetricTracker()
 
-    pbar = tqdm(train_loader, desc="Training")
-        
-    for images, texts in pbar:
+    pbar = tqdm(train_loader, desc="Training", leave=False)
+    for step, batch in enumerate(pbar, start=1):
+        batch = _move_batch_to_device(batch, device)
+        batch_size = batch["images"].shape[0]
 
-        images = images.to(device)
-        texts = texts.to(device)
-        
-        optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, texts)
-        loss.backward()
-        optimizer.step()
+        with _autocast(device, enabled=use_amp):
+            loss, log_probs = _ctc_loss_from_batch(model, batch, criterion)
+            loss_for_backward = loss / accumulation_steps
 
-        batch_metrics = metrics(outputs, texts)
-        for k, v in batch_metrics.items():
-            running_metrics[k] = running_metrics.get(k, 0.0) + v
-        
-        # train_metrics = metrics(outputs, texts)
-        running_loss += loss.item()
-        n_batches += 1
-    
-    if n_batches == 0:
-        return 0.0, {}
-    
-    avg_loss = running_loss / n_batches
-    avg_metrics = {k: v / n_batches for k, v in running_metrics.items()}
+        scaler.scale(loss_for_backward).backward()
 
-    return avg_loss, avg_metrics
+        if step % accumulation_steps == 0 or step == len(train_loader):
+            if max_grad_norm is not None:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        running_loss += float(loss.detach().cpu()) * batch_size
+        sample_count += batch_size
+
+        if compute_metrics:
+            predictions = ctc_greedy_decode(
+                log_probs.detach(),
+                input_lengths=batch["input_lengths"].detach().cpu(),
+                alphabet=alphabet,
+                blank_index=blank_index,
+            )
+            tracker.update(predictions, batch["texts"])
+
+        metrics = tracker.compute() if compute_metrics else {}
+        pbar.set_postfix({"loss": running_loss / sample_count, **metrics})
+
+    avg_loss = running_loss / max(1, sample_count)
+    return avg_loss, tracker.compute() if compute_metrics else {}
 
 
-# Validate function on one epoch
-def validate_epoch(model, val_loader, criterion, metrics):
-    """
-    Input:
-        model (nn.Module class) - using model
-        val_loader (torch.Dataloader) - DataLoader for val dataset
-        criterion (function) - using criterion in validation
-        metrics (function) - calculated metrics for researching
-    Output:
-        avg_loss (float) - average loss
-        avg_metrics (dict) - average metrics
-
-    """
-    device='cuda' if torch.cuda.is_available() else 'cpu'
+def validate_epoch(
+    model: torch.nn.Module,
+    val_loader,
+    criterion: torch.nn.Module,
+    *,
+    device: torch.device | str | None = None,
+    alphabet: str = DEFAULT_OCR_ALPHABET,
+    blank_index: int = 0,
+    use_amp: bool = True,
+) -> tuple[float, dict[str, float]]:
+    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
     model.eval()
-
     running_loss = 0.0
-    running_metrics = {}
-    n_batches = 0
+    sample_count = 0
+    tracker = OCRMetricTracker()
 
-    pbar = tqdm(val_loader, desc="Validation")
-
+    pbar = tqdm(val_loader, desc="Validation", leave=False)
     with torch.no_grad():
-        for images, texts in pbar:
-            images = images.to(device)
-            texts = texts.to(device)
+        for batch in pbar:
+            batch = _move_batch_to_device(batch, device)
+            batch_size = batch["images"].shape[0]
 
-            outputs = model(images)
+            with _autocast(device, enabled=use_amp):
+                loss, log_probs = _ctc_loss_from_batch(model, batch, criterion)
 
-            loss = criterion(outputs, texts)
-            
-            batch_metrics = metrics(outputs, texts)
-            for k, v in batch_metrics.items():
-                running_metrics[k] = running_metrics.get(k, 0.0) + v
+            running_loss += float(loss.detach().cpu()) * batch_size
+            sample_count += batch_size
 
-            # val_metrics = metrics(outputs, texts)
-            running_loss += loss.item()
-            
-            n_batches += 1
+            predictions = ctc_greedy_decode(
+                log_probs.detach(),
+                input_lengths=batch["input_lengths"].detach().cpu(),
+                alphabet=alphabet,
+                blank_index=blank_index,
+            )
+            tracker.update(predictions, batch["texts"])
+            pbar.set_postfix({"loss": running_loss / sample_count, **tracker.compute()})
 
-    if n_batches == 0:
-        return 0.0, {}
-
-    avg_loss = running_loss / n_batches
-    avg_metrics = {k: v / n_batches for k, v in running_metrics.items()}
-
-    return avg_loss, avg_metrics
+    avg_loss = running_loss / max(1, sample_count)
+    return avg_loss, tracker.compute()
 
 
-# Counting parameters of model function
-def count_parameters(model):
-    parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    return parameters
+def _scheduler_step(scheduler, metric: float | None = None) -> None:
+    if scheduler is None:
+        return
+
+    if scheduler.__class__.__name__ == "ReduceLROnPlateau":
+        scheduler.step(metric)
+    else:
+        scheduler.step()
 
 
-# Train function
-def train_model(model, num_epochs,
-                train_loader, val_loader,
-                criterion, optimizer, scheduler, metrics,
-                objective_metric=None):
-    """
-    Input:
-        model (nn.Module class) - using model
-        train_loader (torch.Dataloader) - DataLoader for train dataset
-        val_loader (torch.Dataloader) - DataLoader for val dataset
-        criterion (function) - using criterion
-        optimizer (function) - using optimizer
-        scheduler (function) - using sheduler
-        metrics (function) - calculated metrics for researching
-        objective_metric (string) - objective metric for comparising a models
-    """
-    device='cuda' if torch.cuda.is_available() else 'cpu'
+def _is_better(value: float, best_value: float, mode: str) -> bool:
+    if mode == "min":
+        return value < best_value
+    if mode == "max":
+        return value > best_value
+    raise ValueError("mode must be 'min' or 'max'")
+
+
+def _checkpoint_payload(
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    epoch: int,
+    best_value: float,
+    best_metric: str,
+    history: dict,
+) -> dict:
+    payload = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "best_value": best_value,
+        "best_metric": best_metric,
+        "history": history,
+    }
+    if scheduler is not None:
+        payload["scheduler_state_dict"] = scheduler.state_dict()
+    if scaler is not None:
+        payload["scaler_state_dict"] = scaler.state_dict()
+    return payload
+
+
+def train_model(
+    model: torch.nn.Module,
+    num_epochs: int,
+    train_loader,
+    val_loader,
+    criterion: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler=None,
+    *,
+    scaler=None,
+    device: torch.device | str | None = None,
+    alphabet: str = DEFAULT_OCR_ALPHABET,
+    blank_index: int = 0,
+    accumulation_steps: int = 1,
+    max_grad_norm: float | None = 1.0,
+    use_amp: bool = True,
+    best_metric: str = "cer",
+    best_mode: str = "min",
+    checkpoint_dir: str | os.PathLike = "checkpoints",
+    resume_path: str | os.PathLike | None = None,
+    history_path: str | os.PathLike = "training_history.json",
+) -> dict:
+    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     model = model.to(device)
+    scaler = scaler or create_grad_scaler(enabled=use_amp)
+
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    best_path = checkpoint_dir / "best_model.pth"
+    last_path = checkpoint_dir / "last_model.pth"
 
     history = {
-        'train_loss': [],
-        'val_loss': [],
-        'lr': []
+        "train_loss": [],
+        "val_loss": [],
+        "lr": [],
+        "train_cer": [],
+        "train_wer": [],
+        "train_accuracy": [],
+        "val_cer": [],
+        "val_wer": [],
+        "val_accuracy": [],
     }
+    start_epoch = 0
+    best_value = math.inf if best_mode == "min" else -math.inf
 
-    best_val = 0.0
-
-    if os.path.exists('best_model.pth'):
-
-        checkpoint = torch.load('best_model.pth', map_location=device)
-
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-
-        start_epoch = checkpoint['epoch'] + 1
-        best_val = checkpoint['best_val']
-        history = checkpoint['history']
-
-        print(f"Загружено: эпоха {start_epoch}, Best Val: {best_val}")
-
-    else:
-        start_epoch = 0
+    if resume_path is not None:
+        checkpoint = torch.load(resume_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if scheduler is not None and "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        if scaler is not None and "scaler_state_dict" in checkpoint:
+            scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        start_epoch = int(checkpoint["epoch"]) + 1
+        best_value = float(checkpoint.get("best_value", best_value))
+        history = checkpoint.get("history", history)
+        print(f"Resumed from epoch {start_epoch}, best {best_metric}: {best_value:.6f}")
 
     for epoch in range(start_epoch, num_epochs):
-        
+        print(f"\nEpoch {epoch + 1}/{num_epochs}")
+
         train_loss, train_metrics = train_epoch(
-            model, train_loader, criterion, optimizer, metrics
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            scaler=scaler,
+            device=device,
+            alphabet=alphabet,
+            blank_index=blank_index,
+            accumulation_steps=accumulation_steps,
+            max_grad_norm=max_grad_norm,
+            use_amp=use_amp,
+            compute_metrics=True,
         )
-
         val_loss, val_metrics = validate_epoch(
-            model, val_loader, criterion, metrics
+            model,
+            val_loader,
+            criterion,
+            device=device,
+            alphabet=alphabet,
+            blank_index=blank_index,
+            use_amp=use_amp,
         )
 
-        # Update learning rate
-        if scheduler is not None:
-            scheduler.step(val_metrics[objective_metric])
-            current_lr = optimizer.param_groups[0]['lr']
+        metric_for_scheduler = val_loss if best_metric == "loss" else val_metrics.get(best_metric)
+        _scheduler_step(scheduler, metric_for_scheduler)
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        history["lr"].append(current_lr)
+        for metric_name in ("cer", "wer", "accuracy"):
+            history[f"train_{metric_name}"].append(train_metrics.get(metric_name, 0.0))
+            history[f"val_{metric_name}"].append(val_metrics.get(metric_name, 0.0))
+
+        if best_metric == "loss":
+            current_value = val_loss
         else:
-            current_lr = optimizer.param_groups[0]['lr']
+            current_value = val_metrics[best_metric]
 
-        history['train_loss'].append(train_loss)
-        history['val_loss'].append(val_loss)
-        history['lr'].append(current_lr)
-        if epoch == 0:
-            metrics_names = train_metrics.keys()
-            history.update({f'train_{k}': [] for k in metrics_names})
-            history.update({f'val_{k}': [] for k in metrics_names})
-        for k in train_metrics.keys():
-            history[f'train_{k}'].append(train_metrics[k])
-            history[f'val_{k}'].append(val_metrics[k])
+        payload = _checkpoint_payload(
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+            epoch,
+            best_value,
+            best_metric,
+            history,
+        )
+        torch.save(payload, last_path)
 
-        if objective_metric == 'loss':
-            objective = val_loss
-        else:
-            objective = val_metrics[objective_metric]
+        if _is_better(current_value, best_value, best_mode):
+            best_value = current_value
+            payload["best_value"] = best_value
+            torch.save(payload, best_path)
+            print(f"Saved best checkpoint: {best_metric}={best_value:.6f}")
 
-        if objective > best_val:
-            best_val = objective
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'best_val': best_val,
-                'history': history
-            }, 'best_model.pth')
-            print(f"  Сохранена лучшая модель! Best Val: {best_val:.4f}")
+        print(
+            "train_loss={:.5f} val_loss={:.5f} "
+            "val_cer={:.5f} val_wer={:.5f} val_acc={:.5f} lr={:.2e}".format(
+                train_loss,
+                val_loss,
+                val_metrics["cer"],
+                val_metrics["wer"],
+                val_metrics["accuracy"],
+                current_lr,
+            )
+        )
 
-    number_of_parameters = count_parameters(model) / 1e6
+        with open(history_path, "w", encoding="utf-8") as file:
+            json.dump(history, file, indent=2)
+
     final_results = {
-        'Number of parameters': number_of_parameters
+        "num_parameters_m": count_parameters(model) / 1e6,
+        "best_metric": best_metric,
+        "best_value": best_value,
     }
-    final_results.update({k: v[-1] for k, v in history.items()})
+    final_results.update({key: values[-1] for key, values in history.items() if values})
 
-    # сохранение метрик
-    with open('final_metrics.json','w') as f:
-        json.dump(final_results, f, indent=2)
+    with open("final_metrics.json", "w", encoding="utf-8") as file:
+        json.dump(final_results, file, indent=2)
+
+    return history
 
 
-def plot_metrics(history):
+def plot_metrics(history: dict) -> None:
+    plt.figure(figsize=(15, 5))
 
-    plt.figure(figsize=(12, 6))
-
-    plt.subplot(1, 2, 1)
-    plt.plot(history['train_loss'], label='Train Loss')
-    plt.plot(history['val_loss'], label='Val Loss')
+    plt.subplot(1, 3, 1)
+    plt.plot(history["train_loss"], label="train")
+    plt.plot(history["val_loss"], label="val")
+    plt.title("Loss")
     plt.legend()
-    plt.title('Losses')
 
-    plt.subplot(1, 2, 2)
-    for metric in history.keys():
-        if metric.startswith('train_') and 'loss' not in metric:
-            plt.plot(history[metric], label=metric)
+    plt.subplot(1, 3, 2)
+    plt.plot(history["train_cer"], label="train CER")
+    plt.plot(history["val_cer"], label="val CER")
+    plt.plot(history["train_wer"], label="train WER")
+    plt.plot(history["val_wer"], label="val WER")
+    plt.title("Error rates")
     plt.legend()
-    plt.title('Metrics')
 
+    plt.subplot(1, 3, 3)
+    plt.plot(history["train_accuracy"], label="train")
+    plt.plot(history["val_accuracy"], label="val")
+    plt.title("Exact match accuracy")
+    plt.legend()
+
+    plt.tight_layout()
     plt.show()
-
