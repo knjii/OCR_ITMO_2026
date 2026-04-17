@@ -6,7 +6,9 @@ Datasets/easyocr_cache/
 Datasets/manifests/
 checkpoints/
 *.pth
-training_history.json
+training_history*
 final_metrics.json
+onnx_models/
+triton_model_repository/
 __pycache__/
 */__pycache__/

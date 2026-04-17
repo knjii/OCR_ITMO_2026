@@ -484,7 +484,9 @@ class SVTRTinyOCR(nn.Module):
         x = self.pool(x).squeeze(2)
         x = x.transpose(1, 2).contiguous()
         x = self.norm(x)
-        logits = self.classifier(x)
+        # CTC is sensitive to non-finite log-probabilities. Under AMP the
+        # classifier can run in fp16, but log_softmax should stay in fp32.
+        logits = self.classifier(x).float()
         log_probs = F.log_softmax(logits, dim=-1)
 
         if self.output_batch_first:

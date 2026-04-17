@@ -18,6 +18,11 @@ import cv2
 import numpy as np
 import torch
 
+try:
+    import Levenshtein
+except ImportError:  # pragma: no cover - optional speedup
+    Levenshtein = None
+
 from Datasets.Dataclass import (
     DEFAULT_OCR_ALPHABET,
     OldBooksDataclass,
@@ -28,10 +33,6 @@ from Datasets.Dataclass import (
 )
 
 
-try:
-    import Levenshtein
-except ImportError:  # pragma: no cover - optional speedup
-    Levenshtein = None
 
 
 @dataclass
@@ -226,6 +227,165 @@ def _save_cached_results(cache_path: Path, results: Sequence[LineOCRResult]) -> 
     cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _relative_manifest_path(path: Path, project_root: Path) -> str:
+    try:
+        return path.relative_to(project_root).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _resize_width_for_crop(crop: np.ndarray, img_height: int, max_width: int) -> int:
+    height, width = crop.shape[:2]
+    if height <= 0 or width <= 0:
+        return 0
+    return min(max_width, max(1, int(round(width * (img_height / height)))))
+
+
+def _split_text_balanced_by_words(text: str, parts: int) -> list[str]:
+    words = text.split()
+    if parts <= 1 or not words:
+        return [text]
+
+    total_chars = sum(len(word) for word in words) + max(0, len(words) - 1)
+    target_chars = max(1, math.ceil(total_chars / parts))
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+
+    for word in words:
+        word_len = len(word) + (1 if current else 0)
+        should_flush = (
+            current
+            and current_len + word_len > target_chars
+            and len(chunks) < parts - 1
+        )
+        if should_flush:
+            chunks.append(" ".join(current))
+            current = [word]
+            current_len = len(word)
+        else:
+            current.append(word)
+            current_len += word_len
+
+    if current:
+        chunks.append(" ".join(current))
+
+    while len(chunks) < parts:
+        chunks.append("")
+    return chunks[:parts]
+
+
+def _text_chunks_for_ctc_limit(text: str, max_target_length: int) -> list[str]:
+    """Split text into word-preserving chunks below the requested CTC target limit."""
+
+    if len(text) <= max_target_length:
+        return [text]
+
+    parts = math.ceil(len(text) / max_target_length)
+    chunks = _split_text_balanced_by_words(text, parts)
+
+    # Very long OCR tokens are rare but possible after normalization. Split them
+    # as a fallback so no target exceeds the configured limit.
+    fixed: list[str] = []
+    for chunk in chunks:
+        if len(chunk) <= max_target_length:
+            fixed.append(chunk)
+            continue
+        for start in range(0, len(chunk), max_target_length):
+            fixed.append(chunk[start : start + max_target_length].strip())
+    return [chunk for chunk in fixed if chunk]
+
+
+def _split_crop_by_text_chunks(
+    crop: np.ndarray,
+    chunks: Sequence[str],
+    img_height: int,
+    max_width: int,
+    min_chunk_width: int,
+) -> list[np.ndarray] | None:
+    if not chunks:
+        return None
+
+    height, width = crop.shape[:2]
+    if height <= 0 or width <= 0:
+        return None
+
+    char_counts = [max(1, len(chunk)) for chunk in chunks]
+    total_chars = sum(char_counts)
+    boundaries = [0]
+    acc = 0
+    for count in char_counts[:-1]:
+        acc += count
+        boundaries.append(int(round(width * acc / total_chars)))
+    boundaries.append(width)
+
+    crop_chunks: list[np.ndarray] = []
+    for idx, chunk_text in enumerate(chunks):
+        x1 = max(0, min(width - 1, boundaries[idx]))
+        x2 = max(x1 + 1, min(width, boundaries[idx + 1]))
+        part = crop[:, x1:x2]
+        resized_width = _resize_width_for_crop(part, img_height=img_height, max_width=max_width)
+        input_length = math.ceil(resized_width / 4)
+        if resized_width < min_chunk_width or len(chunk_text) > input_length:
+            return None
+        crop_chunks.append(part)
+
+    return crop_chunks
+
+
+def expand_result_to_manifest_rows(
+    page: dict,
+    result: LineOCRResult,
+    line_dir: Path,
+    project_root: Path,
+    alphabet: str = DEFAULT_OCR_ALPHABET,
+    img_height: int = 32,
+    max_width: int = 512,
+    max_target_length: int = 112,
+    min_chunk_width: int = 16,
+    overwrite_images: bool = False,
+) -> list[tuple[str, str]]:
+    """Return one or more CTC-valid manifest rows for a line alignment result."""
+
+    text = normalize_ocr_text(result.aligned_text, alphabet=alphabet)
+    if not text:
+        return []
+
+    image = page["image"]
+    x1, y1, x2, y2 = result.box
+    crop = image[y1:y2, x1:x2]
+    resized_width = _resize_width_for_crop(crop, img_height=img_height, max_width=max_width)
+    input_length = math.ceil(resized_width / 4)
+
+    if len(text) <= min(max_target_length, input_length):
+        return [(result.image_path, text)]
+
+    chunks = _text_chunks_for_ctc_limit(text, max_target_length=max_target_length)
+    crop_chunks = _split_crop_by_text_chunks(
+        crop=crop,
+        chunks=chunks,
+        img_height=img_height,
+        max_width=max_width,
+        min_chunk_width=min_chunk_width,
+    )
+    if crop_chunks is None:
+        return []
+
+    page_id = page["image_id"]
+    page_line_dir = line_dir / page_id
+    page_line_dir.mkdir(parents=True, exist_ok=True)
+
+    rows: list[tuple[str, str]] = []
+    for chunk_idx, (chunk_crop, chunk_text) in enumerate(zip(crop_chunks, chunks)):
+        chunk_crop = resize_line_image(chunk_crop, img_height=img_height, max_width=max_width)
+        chunk_path = page_line_dir / f"{page_id}_{result.line_idx:04d}_part{chunk_idx:02d}.png"
+        if overwrite_images or not chunk_path.exists():
+            cv2.imwrite(str(chunk_path), chunk_crop)
+        rows.append((_relative_manifest_path(chunk_path, project_root), chunk_text))
+
+    return rows
+
+
 def process_page(
     page: dict,
     reader,
@@ -261,15 +421,10 @@ def process_page(
                 cv2.imwrite(str(line_path), crop)
 
             rough_text = recognize_line(reader, crop, alphabet=alphabet)
-            try:
-                manifest_path = line_path.relative_to(project_root).as_posix()
-            except ValueError:
-                manifest_path = line_path.as_posix()
-
             rough_results.append(
                 LineOCRResult(
                     line_idx=line_idx,
-                    image_path=manifest_path,
+                    image_path=_relative_manifest_path(line_path, project_root),
                     box=tuple(int(v) for v in box),
                     rough_text=rough_text,
                 )
@@ -297,6 +452,8 @@ def build_aligned_manifest(
     alphabet: str = DEFAULT_OCR_ALPHABET,
     img_height: int = 32,
     max_width: int = 512,
+    max_target_length: int = 112,
+    min_chunk_width: int = 16,
     gpu: bool | None = None,
     limit_pages: int | None = None,
     overwrite_images: bool = False,
@@ -341,15 +498,34 @@ def build_aligned_manifest(
         )
 
         kept = 0
+        skipped = 0
+        split_parts = 0
         for result in results:
-            if not result.aligned_text:
+            manifest_rows = expand_result_to_manifest_rows(
+                page=page,
+                result=result,
+                line_dir=line_dir,
+                project_root=project_root,
+                alphabet=alphabet,
+                img_height=img_height,
+                max_width=max_width,
+                max_target_length=max_target_length,
+                min_chunk_width=min_chunk_width,
+                overwrite_images=overwrite_images,
+            )
+            if not manifest_rows:
+                skipped += 1
                 continue
-            rows.append(f"{result.image_path}\t{result.aligned_text}")
-            kept += 1
+
+            for image_path, text in manifest_rows:
+                rows.append(f"{image_path}\t{text}")
+            kept += len(manifest_rows)
+            split_parts += max(0, len(manifest_rows) - 1)
 
         print(
             f"[{page_idx + 1:04d}/{len(dataset):04d}] "
-            f"{page['image_id']}: lines={len(results)}, kept={kept}"
+            f"{page['image_id']}: lines={len(results)}, kept={kept}, "
+            f"split_parts={split_parts}, skipped={skipped}"
         )
 
     output_manifest.write_text("\n".join(rows) + ("\n" if rows else ""), encoding="utf-8")
@@ -367,6 +543,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-dir", default="Datasets/easyocr_cache")
     parser.add_argument("--img-height", type=int, default=32)
     parser.add_argument("--max-width", type=int, default=512)
+    parser.add_argument("--max-target-length", type=int, default=112)
+    parser.add_argument("--min-chunk-width", type=int, default=16)
     parser.add_argument("--limit-pages", type=int, default=None)
     parser.add_argument("--cpu", action="store_true", help="Force EasyOCR to run on CPU.")
     parser.add_argument("--overwrite-images", action="store_true")
@@ -385,6 +563,8 @@ def main() -> None:
         cache_dir=args.cache_dir,
         img_height=args.img_height,
         max_width=args.max_width,
+        max_target_length=args.max_target_length,
+        min_chunk_width=args.min_chunk_width,
         gpu=False if args.cpu else None,
         limit_pages=args.limit_pages,
         overwrite_images=args.overwrite_images,

@@ -42,6 +42,14 @@ def _autocast(device: torch.device, enabled: bool):
     return nullcontext()
 
 
+def _autocast_disabled(device: torch.device):
+    if device.type == "cuda":
+        if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+            return torch.amp.autocast(device_type="cuda", enabled=False)
+        return torch.cuda.amp.autocast(enabled=False)
+    return nullcontext()
+
+
 def _as_batch_first(log_probs: torch.Tensor, batch_size: int) -> torch.Tensor:
     if log_probs.ndim != 3:
         raise ValueError(f"Expected 3D CTC log_probs, got shape {tuple(log_probs.shape)}")
@@ -195,13 +203,72 @@ def _ctc_loss_from_batch(
 
     input_lengths = batch["input_lengths"].to("cpu")
     target_lengths = batch["target_lengths"].to("cpu")
+    targets = batch["targets"]
 
-    loss = criterion(
-        time_first,
-        batch["targets"],
-        input_lengths,
-        target_lengths,
-    )
+    if not torch.isfinite(time_first).all():
+        finite_mask = torch.isfinite(time_first)
+        finite_ratio = finite_mask.float().mean().detach().cpu().item()
+        raise FloatingPointError(
+            "Model produced non-finite log probabilities. "
+            f"log_probs_shape={tuple(time_first.shape)}, "
+            f"dtype={time_first.dtype}, finite_ratio={finite_ratio:.6f}, "
+            f"image_range=({float(images.min().detach().cpu()):.4f}, "
+            f"{float(images.max().detach().cpu()):.4f})"
+        )
+
+    if (target_lengths > input_lengths).any():
+        bad_idx = torch.nonzero(target_lengths > input_lengths, as_tuple=False).flatten()
+        preview = [
+            {
+                "batch_idx": int(idx),
+                "input_length": int(input_lengths[idx]),
+                "target_length": int(target_lengths[idx]),
+                "text": batch.get("texts", [""] * batch_size)[int(idx)][:120],
+                "image_path": batch.get("image_paths", [""] * batch_size)[int(idx)],
+            }
+            for idx in bad_idx[:5]
+        ]
+        raise ValueError(f"CTC target is longer than input sequence: {preview}")
+
+    # CTCLoss is numerically fragile in fp16. Keep model activations under AMP,
+    # but compute the CTC objective in fp32.
+    with _autocast_disabled(time_first.device):
+        loss = criterion(
+            time_first.float(),
+            targets,
+            input_lengths,
+            target_lengths,
+        )
+
+    if not torch.isfinite(loss):
+        per_sample_loss = torch.nn.functional.ctc_loss(
+            time_first.float(),
+            targets,
+            input_lengths,
+            target_lengths,
+            blank=getattr(criterion, "blank", 0),
+            reduction="none",
+            zero_infinity=True,
+        )
+        bad_loss_idx = torch.nonzero(~torch.isfinite(per_sample_loss), as_tuple=False).flatten()
+        preview = [
+            {
+                "batch_idx": int(idx),
+                "input_length": int(input_lengths[idx]),
+                "target_length": int(target_lengths[idx]),
+                "loss": float(per_sample_loss[idx].detach().cpu()),
+                "text": batch.get("texts", [""] * batch_size)[int(idx)][:120],
+                "image_path": batch.get("image_paths", [""] * batch_size)[int(idx)],
+            }
+            for idx in bad_loss_idx[:5]
+        ]
+        raise FloatingPointError(
+            "CTCLoss became non-finite. "
+            f"log_probs_shape={tuple(time_first.shape)}, "
+            f"input_lengths=({int(input_lengths.min())}, {int(input_lengths.max())}), "
+            f"target_lengths=({int(target_lengths.min())}, {int(target_lengths.max())}), "
+            f"bad_loss_samples={preview}"
+        )
     return loss, log_probs
 
 
