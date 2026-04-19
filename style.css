@@ -1,0 +1,28 @@
+h1 {
+    text-align: center;
+}
+
+.stText {
+    text-align: center;
+}
+
+/* Стили для кнопок */
+.stButton > button {
+    width: 100%;
+    background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    border: none;
+    padding: 12px 24px;
+    border-radius: 8px;
+    font-size: 16px;
+    font-weight: 500;
+    transition: all 0.3s ease;
+    cursor: pointer;
+}
+
+.stButton > button:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 12px rgba(0,0,0,0.15);
+    background: linear-gradient(90deg, #764ba2 0%, #667eea 100%);
+}
+
