@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+python-multipart
+tritonclient[http]
+numpy
+opencv-python-headless
+pydantic

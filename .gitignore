@@ -1,0 +1,15 @@
+Datasets/300dpi/tiff/*.tiff
+Datasets/groundtruth/*.txt
+Datasets/lines_bootstrap/
+Datasets/lines_aligned/
+Datasets/easyocr_cache/
+Datasets/manifests/
+checkpoints/
+*.pth
+training_history*
+final_metrics.json
+onnx_models/
+triton_model_repository/svtr_ocr_trt/
+__pycache__/
+*/__pycache__/
+.streamlit/secrets.toml
