@@ -41,6 +41,20 @@ class OCRPageResponse(BaseModel):
     model_version: str
 
 
+class OCRBatchPage(BaseModel):
+    filename: str
+    text: str
+    lines: list[OCRLine] = Field(default_factory=list)
+    processing_ms: float
+
+
+class OCRBatchResponse(BaseModel):
+    pages: list[OCRBatchPage]
+    processing_ms: float
+    model_name: str
+    model_version: str
+
+
 class OCRLineResponse(BaseModel):
     text: str
     confidence: float
@@ -74,6 +88,6 @@ class ModelInfoResponse(BaseModel):
     model_version: str
     max_width: int
     default_batch_size: int
+    max_batch_size: int
     alphabet_size: int
     blank_index: int
-

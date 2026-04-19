@@ -3,5 +3,5 @@ uvicorn[standard]
 python-multipart
 tritonclient[http]
 numpy
-opencv-python
+opencv-python-headless
 pydantic

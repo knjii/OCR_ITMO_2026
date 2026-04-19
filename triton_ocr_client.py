@@ -12,11 +12,12 @@ from typing import Sequence
 import cv2
 import numpy as np
 
-from Datasets.Dataclass import DEFAULT_OCR_ALPHABET, extract_line_boxes_horizontal_projection
-from inference import (
+from ocr_runtime import (
+    DEFAULT_OCR_ALPHABET,
     OCRLineResult,
     OCRPageResult,
     OCRPartResult,
+    extract_line_boxes_horizontal_projection,
     merge_chunk_texts,
     read_image_grayscale,
     result_to_dict,
@@ -148,43 +149,115 @@ class TritonOCRClient:
         overlap: int = 64,
         batch_size: int = 2,
     ) -> OCRPageResult:
-        if page_image.ndim == 3:
-            page_image = cv2.cvtColor(page_image, cv2.COLOR_BGR2GRAY)
+        return self.predict_pages([page_image], overlap=overlap, batch_size=batch_size)[0]
 
-        boxes = extract_line_boxes_horizontal_projection(page_image)
+    def predict_pages(
+        self,
+        page_images: Sequence[np.ndarray],
+        *,
+        overlap: int = 64,
+        batch_size: int = 2,
+    ) -> list[OCRPageResult]:
+        gray_pages = []
+        for page_image in page_images:
+            if page_image.ndim == 3:
+                page_image = cv2.cvtColor(page_image, cv2.COLOR_BGR2GRAY)
+            gray_pages.append(page_image)
+
+        page_boxes = [extract_line_boxes_horizontal_projection(page_image) for page_image in gray_pages]
+
         all_crops: list[np.ndarray] = []
-        chunk_meta: list[tuple[int, tuple[int, int, int, int]]] = []
+        chunk_meta: list[tuple[int, int, tuple[int, int, int, int]]] = []
 
-        for line_idx, bbox in enumerate(boxes):
-            x1, y1, x2, y2 = bbox
-            crop = page_image[y1:y2, x1:x2]
-            for chunk_crop, chunk_bbox in split_long_line_crop(
-                crop,
-                page_bbox=bbox,
-                img_height=32,
-                max_width=self.max_width,
-                overlap=overlap,
-            ):
-                all_crops.append(chunk_crop)
-                chunk_meta.append((line_idx, chunk_bbox))
+        for page_idx, (page_image, boxes) in enumerate(zip(gray_pages, page_boxes)):
+            for line_idx, bbox in enumerate(boxes):
+                x1, y1, x2, y2 = bbox
+                crop = page_image[y1:y2, x1:x2]
+                for chunk_crop, chunk_bbox in split_long_line_crop(
+                    crop,
+                    page_bbox=bbox,
+                    img_height=32,
+                    max_width=self.max_width,
+                    overlap=overlap,
+                ):
+                    all_crops.append(chunk_crop)
+                    chunk_meta.append((page_idx, line_idx, chunk_bbox))
 
         predictions = self.predict_line_crops(all_crops, batch_size=batch_size)
-        grouped_parts: list[list[OCRPartResult]] = [[] for _ in boxes]
-        for (line_idx, chunk_bbox), (text, confidence, width) in zip(chunk_meta, predictions):
-            grouped_parts[line_idx].append(
+        grouped_parts: list[list[list[OCRPartResult]]] = [
+            [[] for _ in boxes] for boxes in page_boxes
+        ]
+        for (page_idx, line_idx, chunk_bbox), (text, confidence, width) in zip(
+            chunk_meta,
+            predictions,
+        ):
+            grouped_parts[page_idx][line_idx].append(
                 OCRPartResult(text=text, confidence=confidence, bbox=chunk_bbox, width=width)
             )
 
-        line_results: list[OCRLineResult] = []
-        for bbox, parts in zip(boxes, grouped_parts):
-            text = merge_chunk_texts([part.text for part in parts])
-            confidence = float(np.mean([part.confidence for part in parts])) if parts else 0.0
-            line_results.append(
-                OCRLineResult(text=text, confidence=confidence, bbox=bbox, parts=parts)
-            )
+        page_results: list[OCRPageResult] = []
+        for boxes, page_parts in zip(page_boxes, grouped_parts):
+            line_results: list[OCRLineResult] = []
+            for bbox, parts in zip(boxes, page_parts):
+                text = merge_chunk_texts([part.text for part in parts])
+                confidence = float(np.mean([part.confidence for part in parts])) if parts else 0.0
+                line_results.append(
+                    OCRLineResult(text=text, confidence=confidence, bbox=bbox, parts=parts)
+                )
 
-        page_text = "\n".join(line.text for line in line_results if line.text)
-        return OCRPageResult(text=page_text, lines=line_results)
+            _clean_page_margin_artifacts(line_results)
+            page_text = "\n".join(line.text for line in line_results).strip()
+            page_results.append(OCRPageResult(text=page_text, lines=line_results))
+
+        return page_results
+
+
+def _clean_page_margin_artifacts(lines: list[OCRLineResult]) -> None:
+    non_empty = [line for line in lines if line.text.strip()]
+    if not non_empty:
+        return
+
+    leading_l_ratio = sum(_has_leading_l_artifact(line.text) for line in non_empty) / len(non_empty)
+    if leading_l_ratio >= 0.35:
+        for line in non_empty:
+            line.text = _strip_leading_l_artifact(line.text)
+
+    trailing_l_ratio = sum(_has_trailing_l_artifact(line.text) for line in non_empty) / len(non_empty)
+    if trailing_l_ratio >= 0.20:
+        for line in non_empty:
+            line.text = _strip_trailing_l_artifact(line.text)
+
+    for line in non_empty:
+        if line.confidence < 0.45 and len(line.text.strip()) <= 2:
+            line.text = ""
+
+
+def _has_leading_l_artifact(text: str) -> bool:
+    stripped = text.lstrip()
+    return len(stripped) >= 4 and stripped[0] == "l" and stripped[1].isalnum()
+
+
+def _strip_leading_l_artifact(text: str) -> str:
+    prefix_len = len(text) - len(text.lstrip())
+    prefix = text[:prefix_len]
+    stripped = text[prefix_len:]
+    while len(stripped) >= 4 and stripped.startswith("l") and stripped[1].isalnum():
+        stripped = stripped[1:]
+    return prefix + stripped
+
+
+def _has_trailing_l_artifact(text: str) -> bool:
+    stripped = text.rstrip()
+    return len(stripped) >= 4 and stripped.endswith("l") and stripped[-2].isalnum()
+
+
+def _strip_trailing_l_artifact(text: str) -> str:
+    suffix_len = len(text) - len(text.rstrip())
+    suffix = text[len(text) - suffix_len :] if suffix_len else ""
+    stripped = text[: len(text) - suffix_len] if suffix_len else text
+    if _has_trailing_l_artifact(stripped):
+        stripped = stripped[:-1]
+    return stripped + suffix
 
 
 def parse_args() -> argparse.Namespace:

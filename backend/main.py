@@ -20,11 +20,12 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 
-from Datasets.Dataclass import DEFAULT_OCR_ALPHABET, extract_line_boxes_horizontal_projection
 from backend.schemas import (
     APIError,
     BoundingBox,
     HealthResponse,
+    OCRBatchPage,
+    OCRBatchResponse,
     ModelInfoResponse,
     OCRLine,
     OCRLineResponse,
@@ -33,6 +34,7 @@ from backend.schemas import (
     PagePreviewResponse,
 )
 from backend.settings import settings
+from ocr_runtime import DEFAULT_OCR_ALPHABET, extract_line_boxes_horizontal_projection
 from triton_ocr_client import TritonOCRClient
 
 
@@ -113,6 +115,11 @@ def _predict_page_with_triton(image: np.ndarray, overlap: int, batch_size: int):
     return client.predict_page(image, overlap=overlap, batch_size=batch_size)
 
 
+def _predict_pages_with_triton(images: list[np.ndarray], overlap: int, batch_size: int):
+    client = get_service().require_ready()
+    return client.predict_pages(images, overlap=overlap, batch_size=batch_size)
+
+
 def _predict_line_with_triton(image: np.ndarray, batch_size: int):
     client = get_service().require_ready()
     return client.predict_line_crops([image], batch_size=batch_size)
@@ -147,6 +154,27 @@ def _line_from_payload(line: dict[str, Any], *, include_parts: bool) -> OCRLine:
         bbox=_bbox_from_sequence(line["bbox"]),
         parts=parts,
     )
+
+
+def _lines_from_result(result, *, include_parts: bool) -> list[OCRLine]:
+    payload = [
+        {
+            "text": line.text,
+            "confidence": line.confidence,
+            "bbox": list(line.bbox),
+            "parts": [
+                {
+                    "text": part.text,
+                    "confidence": part.confidence,
+                    "bbox": list(part.bbox),
+                    "width": part.width,
+                }
+                for part in line.parts
+            ],
+        }
+        for line in result.lines
+    ]
+    return [_line_from_payload(line, include_parts=include_parts) for line in payload]
 
 
 def _decode_image(content: bytes) -> np.ndarray:
@@ -232,6 +260,7 @@ def model_info() -> ModelInfoResponse:
         model_version=settings.model_version,
         max_width=settings.max_width,
         default_batch_size=settings.default_batch_size,
+        max_batch_size=settings.max_batch_size,
         alphabet_size=len(DEFAULT_OCR_ALPHABET) + 1,
         blank_index=0,
     )
@@ -271,7 +300,7 @@ async def recognize_page(
     return_lines: bool = Form(True),
     return_parts: bool = Form(False),
     overlap: int = Form(settings.default_overlap, ge=0, le=256),
-    batch_size: int = Form(settings.default_batch_size, ge=1, le=64),
+    batch_size: int = Form(settings.default_batch_size, ge=1, le=settings.max_batch_size),
 ) -> OCRPageResponse:
     started = time.perf_counter()
     image = await _read_upload(file)
@@ -279,33 +308,59 @@ async def recognize_page(
     result = await run_in_threadpool(_predict_page_with_triton, image, overlap, batch_size)
     lines = []
     if return_lines:
-        payload = {
-            "lines": [
-                {
-                    "text": line.text,
-                    "confidence": line.confidence,
-                    "bbox": list(line.bbox),
-                    "parts": [
-                        {
-                            "text": part.text,
-                            "confidence": part.confidence,
-                            "bbox": list(part.bbox),
-                            "width": part.width,
-                        }
-                        for part in line.parts
-                    ],
-                }
-                for line in result.lines
-            ]
-        }
-        lines = [
-            _line_from_payload(line, include_parts=return_parts)
-            for line in payload["lines"]
-        ]
+        lines = _lines_from_result(result, include_parts=return_parts)
 
     return OCRPageResponse(
         text=result.text,
         lines=lines,
+        processing_ms=(time.perf_counter() - started) * 1000,
+        model_name=settings.model_name,
+        model_version=settings.model_version,
+    )
+
+
+@app.post(
+    "/v1/ocr/pages",
+    response_model=OCRBatchResponse,
+    responses={
+        400: {"model": APIError},
+        413: {"model": APIError},
+        503: {"model": APIError},
+    },
+    tags=["ocr"],
+)
+async def recognize_pages(
+    files: list[UploadFile] = File(...),
+    return_lines: bool = Form(True),
+    return_parts: bool = Form(False),
+    overlap: int = Form(settings.default_overlap, ge=0, le=256),
+    batch_size: int = Form(settings.default_batch_size, ge=1, le=settings.max_batch_size),
+) -> OCRBatchResponse:
+    started = time.perf_counter()
+    if not files:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "EMPTY_FILES", "message": "Upload at least one image"},
+        )
+
+    page_started = [time.perf_counter() for _ in files]
+    images = [await _read_upload(file) for file in files]
+    results = await run_in_threadpool(_predict_pages_with_triton, images, overlap, batch_size)
+
+    pages = []
+    for file, result, item_started in zip(files, results, page_started):
+        lines = _lines_from_result(result, include_parts=return_parts) if return_lines else []
+        pages.append(
+            OCRBatchPage(
+                filename=file.filename or "image",
+                text=result.text,
+                lines=lines,
+                processing_ms=(time.perf_counter() - item_started) * 1000,
+            )
+        )
+
+    return OCRBatchResponse(
+        pages=pages,
         processing_ms=(time.perf_counter() - started) * 1000,
         model_name=settings.model_name,
         model_version=settings.model_version,
@@ -324,7 +379,7 @@ async def recognize_page(
 )
 async def recognize_line(
     file: UploadFile = File(...),
-    batch_size: int = Form(1, ge=1, le=64),
+    batch_size: int = Form(1, ge=1, le=settings.max_batch_size),
 ) -> OCRLineResponse:
     started = time.perf_counter()
     image = await _read_upload(file)
